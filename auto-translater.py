@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
 import os
-import openai  # pip install openai
 import sys
 import re
 import yaml  # pip install PyYAML
-import env
+from modelscope.pipelines import pipeline
+from modelscope.utils.constant import Tasks
+import logging
+import tensorflow as tf
 
-# 设置 OpenAI API Key 和 API Base 参数，通过 env.py 传入
-openai.api_key = os.environ.get("CHATGPT_API_KEY")
-openai.api_base = os.environ.get("CHATGPT_API_BASE")
+logging.basicConfig(level=logging.ERROR) 
 
 # 设置最大输入字段，超出会拆分输入，防止超出输入字数限制
 max_length = 1800
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1,"
+gpus = tf.config.experimental.list_physical_devices('GPU')
+print("GPU: ", gpus)
+pipeline_ins = pipeline(task=Tasks.translation, model="damo/nlp_csanmt_translation_zh2en", device="cpu")
 
 # 设置翻译的路径
 dir_to_translate = "testdir/to-translate"
@@ -143,35 +148,10 @@ def front_matter_replace(value, lang):
 
 # 定义调用 ChatGPT API 翻译的函数
 def translate_text(text, lang, type):
-    target_lang = {
-        "en": "English",
-        "es": "Spanish",
-        "ar": "Arabic"
-    }[lang]
-    
-    # Front Matter 与正文内容使用不同的 prompt 翻译
-    # 翻译 Front Matter。
-    if type == "front-matter":
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a professional translation engine, please translate the text into a colloquial, professional, elegant and fluent content, without the style of machine translation. You must only translate the text content, never interpret it."},
-                {"role": "user", "content": f"Translate into {target_lang}:\n\n{text}\n"},
-            ],
-        )  
-    # 翻译正文
-    elif type== "main-body":
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a professional translation engine, please translate the text into a colloquial, professional, elegant and fluent content, without the style of machine translation. You must maintain the original markdown format. You must not translate the `[to_be_replace[x]]` field.You must only translate the text content, never interpret it."},
-                {"role": "user", "content": f"Translate into {target_lang}:\n\n{text}\n"},
-            ],
-        )
-
-    # 获取翻译结果
-    output_text = completion.choices[0].message.content
-    return output_text
+    print("Input: ", text);
+    outputs = pipeline_ins(input=text)
+    print("Output: ", outputs['translation'])
+    return outputs['translation']
 
 # Front Matter 处理规则
 def translate_front_matter(front_matter, lang):
@@ -229,104 +209,50 @@ def translate_file(input_file, filename, lang):
     with open(input_file, "r", encoding="utf-8") as f:
         input_text = f.read()
 
-    # 创建一个字典来存储占位词和对应的替换文本
-    placeholder_dict = {}
-
-    # 使用 for 循环应用替换规则，并将匹配的文本替换为占位词
-    for i, rule in enumerate(replace_rules):
-        find_text = rule["orginal_text"]
-        replace_with = rule["replaced_text"][lang]
-        placeholder = f"[to_be_replace[{i + 1}]]"
-        input_text = input_text.replace(find_text, placeholder)
-        placeholder_dict[placeholder] = replace_with
-
-    # 删除译文中指示强制翻译的 marker
-    input_text = input_text.replace(marker_force_translate, "")
-
-    # 删除其他出英文外其他语言译文中的 marker_written_in_en
-    if lang != "en":
-        input_text = input_text.replace(marker_written_in_en, "")
-
-    # 使用正则表达式来匹配 Front Matter
-    front_matter_match = re.search(r'---\n(.*?)\n---', input_text, re.DOTALL)
-    if front_matter_match:
-        front_matter_text = front_matter_match.group(1)
-        # 使用PyYAML加载YAML格式的数据
-        front_matter_data = yaml.safe_load(front_matter_text)
-
-        # 按照前文的规则对 Front Matter 进行翻译
-        front_matter_data = translate_front_matter(front_matter_data, lang)
-
-        # 将处理完的数据转换回 YAML
-        front_matter_text_processed = yaml.dump(
-            front_matter_data, allow_unicode=True, default_style=None, sort_keys=False)
-
-        # 暂时删除未处理的 Front Matter
-        input_text = input_text.replace(
-            "---\n"+front_matter_text+"\n---\n", "")
-    else:
-        # print("没有找到front matter，不进行处理。")
-        pass
-
-    # print(input_text) # debug 用，看看输入的是什么
-
     # 拆分文章
-    paragraphs = input_text.split("\n\n")
+    punctuation_pattern = re.compile('[，。！？、；：“”‘’（）《》【】#,!?;:\'"*{}()-+\n|-]')
+    paragraphs = []
+    matches = list(punctuation_pattern.finditer(input_text))
+    start_index = 0
+    for match in matches:  
+        # 添加分隔符之前的文本（如果有的话）  
+        if match.start() > start_index:
+            paragraphs.append(input_text[start_index:match.start()])  
+        # 添加分隔符本身  
+        paragraphs.append(match.group())  
+        # 更新开始索引为分隔符之后的位置  
+        start_index = match.end()
+
+    if start_index < len(input_text):  
+        paragraphs.append(input_text[start_index:]) 
+
     input_text = ""
     output_paragraphs = []
-    current_paragraph = ""
 
+    pattern = re.compile(r'[\u4e00-\u9fff]+')
     for paragraph in paragraphs:
-        if len(current_paragraph) + len(paragraph) + 2 <= max_length:
-            # 如果当前段落加上新段落的长度不超过最大长度，就将它们合并
-            if current_paragraph:
-                current_paragraph += "\n\n"
-            current_paragraph += paragraph
+        match = pattern.search(paragraph)
+        if match:
+            output_paragraphs.append(translate_text(paragraph, lang, "main-body"))
         else:
-            # 否则翻译当前段落，并将翻译结果添加到输出列表中
-            output_paragraphs.append(translate_text(current_paragraph, lang,"main-body"))
-            current_paragraph = paragraph
-
-    # 处理最后一个段落
-    if current_paragraph:
-        if len(current_paragraph) + len(input_text) <= max_length:
-            # 如果当前段落加上之前的文本长度不超过最大长度，就将它们合并
-            input_text += "\n\n" + current_paragraph
-        else:
-            # 否则翻译当前段落，并将翻译结果添加到输出列表中
-            output_paragraphs.append(translate_text(current_paragraph, lang,"main-body"))
-
-    # 如果还有未翻译的文本，就将它们添加到输出列表中
-    if input_text:
-        output_paragraphs.append(translate_text(input_text, lang,"main-body"))
+            output_paragraphs.append(paragraph)
 
     # 将输出段落合并为字符串
     output_text = "\n\n".join(output_paragraphs)
 
-    if front_matter_match:
-        # 加入 Front Matter
-        output_text = "---\n" + front_matter_text_processed + "---\n\n" + output_text
-
-    # 加入由 ChatGPT 翻译的提示
-    if lang == "en":
-        output_text = output_text + tips_translated_by_chatgpt["en"]
-    elif lang == "es":
-        output_text = output_text + tips_translated_by_chatgpt["es"]
-    elif lang == "ar":
-        output_text = output_text + tips_translated_by_chatgpt["ar"]
-
-    # 最后，将占位词替换为对应的替换文本
-    for placeholder, replacement in placeholder_dict.items():
-        output_text = output_text.replace(placeholder, replacement)
-
     # 写入输出文件
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(output_text)
 
 # 按文件名称顺序排序
-file_list = os.listdir(dir_to_translate)
+file_list = []
+for root, dirs, files in os.walk(dir_to_translate):  
+        for file in files:  
+            if file.endswith(".md"):
+                file_list.append(os.path.join(root, file))  
+
 sorted_file_list = sorted(file_list)
-# print(sorted_file_list)
 
 try:
     # 创建一个外部列表文件，存放已处理的 Markdown 文件名列表
@@ -338,7 +264,7 @@ try:
     # 遍历目录下的所有.md文件，并进行翻译
     for filename in sorted_file_list:
         if filename.endswith(".md"):
-            input_file = os.path.join(dir_to_translate, filename)
+            input_file = filename
 
             # 读取 Markdown 文件的内容
             with open(input_file, "r", encoding="utf-8") as f:
@@ -348,30 +274,10 @@ try:
             with open(processed_list, "r", encoding="utf-8") as f:
                 processed_list_content = f.read()
 
-            if marker_force_translate in md_content:  # 如果有强制翻译的标识，则执行这部分的代码
-                if marker_written_in_en in md_content:  # 翻译为除英文之外的语言
-                    print("Pass the en-en translation: ", filename)
-                    sys.stdout.flush()
-                    translate_file(input_file, filename, "es")
-                    translate_file(input_file, filename, "ar")
-                else:  # 翻译为所有语言
-                    translate_file(input_file, filename, "en")
-                    translate_file(input_file, filename, "es")
-                    translate_file(input_file, filename, "ar")
-            elif filename in exclude_list:  # 不进行翻译
-                print(f"Pass the post in exclude_list: {filename}")
-                sys.stdout.flush()
-            elif filename in processed_list_content:  # 不进行翻译
+            if filename in processed_list_content:  # 不进行翻译
                 print(f"Pass the post in processed_list: {filename}")
                 sys.stdout.flush()
-            elif marker_written_in_en in md_content:  # 翻译为除英文之外的语言
-                print(f"Pass the en-en translation: {filename}")
-                sys.stdout.flush()
-                for lang in ["es", "ar"]:
-                    translate_file(input_file, filename, lang)
-            else:  # 翻译为所有语言
-                for lang in ["en", "es", "ar"]:
-                    translate_file(input_file, filename, lang)
+            translate_file(input_file, filename, "en")
 
             # 将处理完成的文件名加到列表，下次跳过不处理
             if filename not in processed_list_content:
@@ -392,4 +298,3 @@ except Exception as e:
     print(f"An error has occurred: {e}")
     sys.stdout.flush()
     raise SystemExit(1)  # 1 表示非正常退出，可以根据需要更改退出码
-    # os.remove(input_file)  # 删除源文件
